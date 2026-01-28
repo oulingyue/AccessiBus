@@ -33,8 +33,8 @@ Google Cloud Console (Enable Directions API)
 2. Installation
 Bash
 # Clone the repository
-git clone https://github.com/your-username/boston-transit-api.git
-cd boston-transit-api
+git clone https://github.com/oulingyue/AccessiBus.git
+cd AccessiBus
 
 # Install dependencies
 pip install flask flask-cors requests polyline
