@@ -338,7 +338,7 @@ def get_directions():
                     'path': path_points
                 })
 
-            # Sort by Earliest Arrival at Destination
+            # Sort by Earliest Arrival at Destination(s)
             valid_routes.sort(key=lambda x: x['sort_arrival'])
             
             # --- 6. RETURN TOP 3 ---
