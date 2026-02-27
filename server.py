@@ -1,34 +1,42 @@
-from flask import Flask, jsonify, request
+from dotenv import load_dotenv
+load_dotenv()
+from flask import Flask, jsonify, request, Response
 from flask_cors import CORS
 import requests
 import os
+import polyline
 from datetime import datetime, timedelta
-
+ 
 app = Flask(__name__)
 CORS(app)
-
-# ============================================
-# 1. CONFIGURATION & KEYS
-# ============================================
-# Ideally, keep these in a .env file. For now, we use defaults if env vars aren't set.
-GOOGLE_DIRECTIONS_API_KEY = os.getenv('GOOGLE_DIRECTIONS_API_KEY', 'AIzaSyAG3UexynPg9bdaRbR5ATxhTuPyB5E64n4')
-MBTA_API_KEY = os.getenv('MBTA_API_KEY', 'd0420e38428547f2b4e0da8ae04cf4b3')
-
+ 
+GOOGLE_DIRECTIONS_API_KEY = os.getenv('GOOGLE_DIRECTIONS_API_KEY')
+MBTA_API_KEY = os.getenv('MBTA_API_KEY')
+ELEVENLABS_API_KEY = os.getenv('ELEVENLABS_API_KEY')
+VOICE_ID = 'UgBBYS2sOqTuMpoF3BR0'
+ 
 MBTA_BASE_URL = 'https://api-v3.mbta.com'
 GOOGLE_BASE_URL = 'https://maps.googleapis.com/maps/api/directions/json'
-
-# ============================================
-# 2. MBTA DATA ENDPOINTS
-# ============================================
-
+ 
+def find_station_id(station_name):
+    try:
+        params = {'filter[route_type]': '0,1', 'api_key': MBTA_API_KEY}
+        res = requests.get(f'{MBTA_BASE_URL}/stops', params=params).json()
+        
+        target = station_name.lower().replace(" station", "").strip()
+        
+        for stop in res['data']:
+            stop_name = stop['attributes']['name'].lower().replace(" station", "").strip()
+            if stop_name == target: return stop['id']
+            if target in stop_name or stop_name in target: return stop['id']
+                
+    except Exception as e:
+        print(f"Station Match Error: {e}")
+    return None
+ 
 @app.route('/api/mbta/stations', methods=['GET'])
 def get_stations():
-    """
-    Fetches all subway stations.
-    The Frontend uses this list to calculate which one is closest to the user.
-    """
     try:
-        # Filter: 0=Light Rail (Green Line), 1=Subway (Red/Orange/Blue)
         params = {
             'filter[route_type]': '0,1',
             'api_key': MBTA_API_KEY,
@@ -41,34 +49,31 @@ def get_stations():
             stations = []
             
             for stop in data:
-                # Attempt to determine line color from description
                 desc = stop['attributes'].get('description', '')
-                route = 'Green' # Default fallback
+                route = 'Green'
                 if 'Red' in desc: route = 'Red'
                 elif 'Orange' in desc: route = 'Orange'
                 elif 'Blue' in desc: route = 'Blue'
                 elif 'Mattapan' in desc: route = 'Red'
-
+ 
+                wheelchair = stop['attributes'].get('wheelchair_boarding', 0)
+                
                 stations.append({
                     'id': stop['id'],
                     'name': stop['attributes']['name'],
                     'lat': stop['attributes']['latitude'],
                     'lng': stop['attributes']['longitude'],
-                    'routes': [route] 
+                    'routes': [route],
+                    'wheelchair_accessible': wheelchair == 1,
+                    'has_parking': stop['attributes'].get('parking', False)
                 })
             return jsonify({'success': True, 'data': stations})
-        
         return jsonify({'success': False, 'data': []})
     except Exception as e:
-        print(f"Error fetching stations: {e}")
         return jsonify({'success': False, 'data': []})
-
+ 
 @app.route('/api/mbta/predictions/<stop_id>', methods=['GET'])
 def get_predictions(stop_id):
-    """
-    Returns upcoming train times for a specific station.
-    Example: "Red Line (Outbound) in 5 minutes"
-    """
     try:
         headers = {"x-api-key": MBTA_API_KEY}
         params = {
@@ -82,26 +87,21 @@ def get_predictions(stop_id):
         predictions = []
         if response.status_code == 200:
             for pred in response.json()['data']:
-                # Calculate minutes until arrival
                 arrival = pred['attributes'].get('arrival_time')
-                departure = pred['attributes'].get('departure_time')
-                target_time = arrival or departure
                 
                 minutes = 0
-                if target_time:
-                    target_dt = datetime.fromisoformat(target_time.replace('Z', '+00:00'))
+                if arrival:
+                    target_dt = datetime.fromisoformat(arrival.replace('Z', '+00:00'))
                     now = datetime.now(target_dt.tzinfo)
                     minutes = max(0, int((target_dt - now).total_seconds() / 60))
-
-                # Determine direction
+ 
                 direction_id = pred['attributes']['direction_id']
                 destination = "Outbound" if direction_id == 0 else "Inbound"
                 
-                # Get Route Name (Red, Orange, etc)
                 route_id = "Subway"
                 if 'relationships' in pred and 'route' in pred['relationships']:
                     route_id = pred['relationships']['route']['data']['id']
-
+ 
                 predictions.append({
                     'id': pred['id'],
                     'route': route_id,
@@ -111,128 +111,109 @@ def get_predictions(stop_id):
                 })
         return jsonify({'success': True, 'data': predictions})
     except Exception as e:
-        print(f"Error predictions: {e}")
         return jsonify({'success': False, 'data': []})
-
-@app.route('/api/mbta/alerts', methods=['GET'])
-def get_alerts():
-    """Returns active service alerts (delays, closures)"""
+ 
+@app.route('/api/mbta/vehicles', methods=['GET'])
+def get_vehicles():
     try:
-        params = {
-            'filter[activity]': 'BOARD,RIDE',
-            'filter[route_type]': '0,1',
-            'api_key': MBTA_API_KEY
-        }
-        response = requests.get(f'{MBTA_BASE_URL}/alerts', params=params)
+        routes_filter = request.args.get('routes')
+        if not routes_filter:
+            return jsonify({'success': True, 'data': []})
+ 
+        headers = {"x-api-key": MBTA_API_KEY}
+        params = {'filter[route]': routes_filter, 'include': 'route'}
+        
+        response = requests.get(f'{MBTA_BASE_URL}/vehicles', params=params, headers=headers)
         
         if response.status_code == 200:
-            raw_alerts = response.json()['data']
-            alerts = []
-            for item in raw_alerts:
-                alerts.append({
-                    'id': item['id'],
-                    'header': item['attributes']['header'],
-                    'description': item['attributes']['description'],
-                    'severity': item['attributes']['severity']
-                })
-            return jsonify({'success': True, 'data': alerts})
+            raw_data = response.json()['data']
+            vehicles = []
+            for v in raw_data:
+                if 'route' in v['relationships']:
+                    route_id = v['relationships']['route']['data']['id']
+                    occupancy = v['attributes'].get('occupancy_status', None)
+                    
+                    vehicles.append({
+                        'id': v['id'],
+                        'lat': v['attributes']['latitude'],
+                        'lng': v['attributes']['longitude'],
+                        'bearing': v['attributes']['bearing'],
+                        'route': route_id,
+                        'status': v['attributes']['current_status'],
+                        'occupancy': occupancy
+                    })
+            return jsonify({'success': True, 'data': vehicles})
+            
         return jsonify({'success': False, 'data': []})
     except Exception as e:
-        return jsonify({'success': False, 'data': []})
+        return jsonify({'success': False, 'error': str(e)}), 500
 
-# ============================================
-# 3. GOOGLE & UTILITY ENDPOINTS
-# ============================================
-
-# @app.route('/api/directions', methods=['POST'])
-# def get_directions():
-#     try:
-#         data = request.json
-#         origin_raw = data.get('origin')
-#         dest_raw = data.get('destination')
-
-#         # 1. Force context to Boston to fix "ZERO_RESULTS"
-#         if isinstance(origin_raw, dict) and 'lat' in origin_raw:
-#             origin = f"{origin_raw['lat']},{origin_raw['lng']}"
-#         else:
-#             origin = f"{origin_raw}, Boston, MA"
-
-#         if isinstance(dest_raw, dict) and 'lat' in dest_raw:
-#             destination = f"{dest_raw['lat']},{dest_raw['lng']}"
-#         else:
-#             destination = f"{dest_raw}, Boston, MA"
-
-#         # 2. Call Google Maps (Transit Mode)
-#         params = {
-#             'origin': origin,
-#             'destination': destination,
-#             'mode': 'transit',
-#             'transit_mode': 'subway', # Prefer subway over bus
-#             'key': GOOGLE_DIRECTIONS_API_KEY
-#         }
+@app.route('/api/mbta/facilities/<stop_id>', methods=['GET'])
+def get_facilities(stop_id):
+    try:
+        headers = {"x-api-key": MBTA_API_KEY}
         
-#         print(f"📡 Calling Google Maps: {origin} -> {destination}")
-#         res = requests.get(GOOGLE_BASE_URL, params=params).json()
+        stop_res = requests.get(f'{MBTA_BASE_URL}/stops/{stop_id}', headers=headers)
         
-#         if res['status'] == 'OK':
-#             leg = res['routes'][0]['legs'][0]
+        if stop_res.status_code == 200:
+            stop_data = stop_res.json()
+            parent_id = stop_id
             
-#             # --- NEW: INTELLIGENT PARSING OF MBTA DETAILS ---
-#             clean_steps = []
+            if 'relationships' in stop_data['data'] and 'parent_station' in stop_data['data']['relationships']:
+                parent_data = stop_data['data']['relationships']['parent_station']['data']
+                if parent_data:
+                    parent_id = parent_data['id']
             
-#             for step in leg['steps']:
-#                 instruction = step['html_instructions']
+            params = {'filter[stop]': parent_id}
+        else:
+            params = {'filter[stop]': stop_id}
+        
+        response = requests.get(f'{MBTA_BASE_URL}/facilities', params=params, headers=headers)
+        
+        facilities = []
+        if response.status_code == 200:
+            data = response.json().get('data', [])
+            
+            for fac in data:
+                attr = fac['attributes']
+                fac_type = attr.get('type', 'UNKNOWN')
                 
-#                 # Case A: It is a Subway/Train ride
-#                 if 'transit_details' in step:
-#                     transit = step['transit_details']
-#                     line_name = transit['line'].get('name', 'Transit')      # e.g. "Green Line E"
-#                     vehicle_type = transit['line'].get('vehicle', {}).get('type', '')
-#                     depart_stop = transit['departure_stop']['name']
-#                     arrive_stop = transit['arrival_stop']['name']
-#                     num_stops = transit.get('num_stops', 0)
-                    
-#                     # Create a rich, specific instruction
-#                     clean_steps.append({
-#                         'instruction': f"Board <b>{line_name}</b> at {depart_stop}"
-#                     })
-#                     clean_steps.append({
-#                         'instruction': f"Ride {num_stops} stops to {arrive_stop}"
-#                     })
-                    
-#                 # Case B: Walking / Transfers
-#                 else:
-#                     # If the instruction says "Walk", keep it simple
-#                     clean_steps.append({'instruction': instruction})
+                if fac_type in ['ELEVATOR', 'ESCALATOR']:
+                    facilities.append({
+                        'id': fac['id'],
+                        'type': fac_type,
+                        'name': attr.get('short_name', 'Unknown'),
+                        'long_name': attr.get('long_name', ''),
+                        'operational': True
+                    })
+        
+        return jsonify({'success': True, 'data': facilities})
+        
+    except Exception as e:
+        print(f"Error fetching facilities: {e}")
+        return jsonify({'success': False, 'data': []})
+ 
 @app.route('/api/directions', methods=['POST'])
 def get_directions():
     try:
         data = request.json
         origin_raw = data.get('origin')
         dest_raw = data.get('destination')
-        # speed_profile: 'slow', 'normal', 'fast' (Default to normal)
-        speed_profile = data.get('walking_speed', 'normal') 
-
-        # --- 1. DEFINE SPEEDS (Meters per Second) ---
-        # Google avg is ~1.4 m/s (3.1 mph)
-        SPEED_MAP = {
-            'slow': 0.9,   # ~2.0 mph (Leisurely/Mobility issues)
-            'normal': 1.4, # ~3.1 mph (Standard)
-            'fast': 1.8    # ~4.0 mph (Brisk walk)
-        }
+        speed_profile = data.get('walking_speed', 'normal')
+ 
+        SPEED_MAP = {'slow': 0.9, 'normal': 1.4, 'fast': 1.8}
         user_speed = SPEED_MAP.get(speed_profile, 1.4)
-
+ 
         if isinstance(origin_raw, dict) and 'lat' in origin_raw:
             origin = f"{origin_raw['lat']},{origin_raw['lng']}"
         else:
             origin = f"{origin_raw}, Boston, MA"
-
+ 
         if isinstance(dest_raw, dict) and 'lat' in dest_raw:
             destination = f"{dest_raw['lat']},{dest_raw['lng']}"
         else:
             destination = f"{dest_raw}, Boston, MA"
-
-        # Ask Google for multiple alternatives
+ 
         params = {
             'origin': origin,
             'destination': destination,
@@ -242,171 +223,214 @@ def get_directions():
             'key': GOOGLE_DIRECTIONS_API_KEY
         }
         
-        print(f"📡 Google Search ({speed_profile}): {origin} -> {destination}")
+        print(f"Google Search ({speed_profile}): {origin} -> {destination}")
         res = requests.get(GOOGLE_BASE_URL, params=params).json()
+        print(f"Google Status: {res.get('status')}")
         
         if res['status'] == 'OK':
             valid_routes = []
             now = datetime.now()
-
+ 
             for i, route in enumerate(res['routes']):
                 leg = route['legs'][0]
                 
-                # --- 2. ANALYZE WALKING SEGMENT ---
+                route_confidence = 'high'
+                route_warning = None
                 total_walk_meters = 0
                 first_station_name = "Destination"
-                train_depart_timestamp = 0
-                
-                # Look through steps to find the walk BEFORE the train
-                for step in leg['steps']:
-                    if step['travel_mode'] == 'WALKING':
-                        # Only count walking BEFORE we hit the train
-                        if train_depart_timestamp == 0: 
-                            total_walk_meters += step['distance']['value']
-                    
-                    elif step['travel_mode'] == 'TRANSIT':
-                        # We found the train!
-                        first_station_name = step['transit_details']['departure_stop']['name']
-                        train_depart_timestamp = step['transit_details']['departure_time']['value']
-                        break 
-                
-                # --- 3. CALCULATE USER'S REAL WALK TIME ---
-                # Formula: Distance / Speed = Seconds
-                user_walk_seconds = int(total_walk_meters / user_speed)
-                
-                # When does the user actually arrive at the platform?
-                user_arrival_at_station_dt = now + timedelta(seconds=user_walk_seconds)
-                user_arrival_timestamp = user_arrival_at_station_dt.timestamp()
-
-                # --- 4. THE FILTER: IS IT CATCHABLE? ---
-                # Only run this check if it involves a train (not a pure walking route)
-                if train_depart_timestamp > 0:
-                    # Buffer: User needs to arrive 60 seconds BEFORE train departs
-                    if user_arrival_timestamp > (train_depart_timestamp - 60):
-                        # print(f"❌ Route {i} IMPOSSIBLE: Arrive {user_arrival_at_station_dt} vs Depart {datetime.fromtimestamp(train_depart_timestamp)}")
-                        continue # Skip this route, it's impossible to catch
-                
-                # --- 5. RECALCULATE ARRIVAL AT DESTINATION ---
-                # Since user walk speed might be different from Google's, adjust the final arrival time
-                original_duration = leg['duration']['value']
-                google_expected_walk = total_walk_meters / 1.4
-                delay_diff = user_walk_seconds - google_expected_walk
-                
-                real_arrival_val = now.timestamp() + original_duration + delay_diff
-                real_duration_min = int((original_duration + delay_diff) / 60)
-                
-                # Format for UI
-                station_eta_text = user_arrival_at_station_dt.strftime("%-I:%M %p")
-                
-                # Countdown Logic
-                diff_min = int((datetime.fromtimestamp(train_depart_timestamp) - now).total_seconds() / 60)
-                countdown_text = f"Departs in {diff_min} min" if diff_min > 0 else "Now"
-
-                # Step Parsing
+                current_virtual_time = 0
                 clean_steps = []
-                transit_lines = [] 
+                transit_lines = []
+ 
                 for step in leg['steps']:
-                    if 'transit_details' in step:
-                        transit = step['transit_details']
-                        line_name = transit['line'].get('name', 'Transit')
-                        depart_stop = transit['departure_stop']['name']
-                        num_stops = transit.get('num_stops', 0)
+                    step_points = polyline.decode(step['polyline']['points'])
+                    step_path = [{'lat': p[0], 'lng': p[1]} for p in step_points]
+                    
+                    if step['travel_mode'] == 'WALKING':
+                        walk_dist = step['distance']['value']
+                        if current_virtual_time == 0: total_walk_meters += walk_dist
+                        
+                        clean_steps.append({
+                            'instruction': step['html_instructions'],
+                            'is_transit': False,
+                            'path': step_path,
+                            'mode': 'walking'
+                        })
+ 
+                    elif step['travel_mode'] == 'TRANSIT':
+                        details = step.get('transit_details', {})
+                        line_name = details.get('line', {}).get('name', 'Transit')
+                        depart_stop = details.get('departure_stop', {}).get('name', 'Unknown Stop')
+                        arrive_stop = details.get('arrival_stop', {}).get('name', 'Unknown Stop')
+                        
+                        step_duration_sec = step.get('duration', {}).get('value', 0)
+
+                        if 'departure_time' in details:
+                            this_depart_ts = details['departure_time']['value']
+                        else:
+                            this_depart_ts = current_virtual_time if current_virtual_time > 0 else int(now.timestamp())
+
+                        if 'arrival_time' in details:
+                            this_arrive_ts = details['arrival_time']['value']
+                        else:
+                            this_arrive_ts = this_depart_ts + step_duration_sec
+                        
+                        depart_id = find_station_id(depart_stop)
+                        arrive_id = find_station_id(arrive_stop)
+
+                        accessibility_text = []
+                        try:
+                            if depart_id:
+                                stop_res = requests.get(f'{MBTA_BASE_URL}/stops/{depart_id}', headers={'x-api-key': MBTA_API_KEY})
+                                if stop_res.status_code == 200:
+                                    stop_data = stop_res.json()['data']
+                                    wheelchair = stop_data['attributes'].get('wheelchair_boarding', 0)
+                                    
+                                    if wheelchair == 1:
+                                        accessibility_text.append("Wheelchair accessible")
+                                    
+                                    parent_id = depart_id
+                                    if 'relationships' in stop_data and 'parent_station' in stop_data['relationships']:
+                                        parent_data = stop_data['relationships']['parent_station']['data']
+                                        if parent_data:
+                                            parent_id = parent_data['id']
+                                    
+                                    fac_res = requests.get(f'{MBTA_BASE_URL}/facilities', params={'filter[stop]': parent_id}, headers={'x-api-key': MBTA_API_KEY})
+                                    if fac_res.status_code == 200:
+                                        facilities = fac_res.json().get('data', [])
+                                        elevator_count = sum(1 for f in facilities if f['attributes']['type'] == 'ELEVATOR')
+                                        escalator_count = sum(1 for f in facilities if f['attributes']['type'] == 'ESCALATOR')
+                                        
+                                        if elevator_count > 0:
+                                            accessibility_text.append(f"{elevator_count} elevator{'s' if elevator_count > 1 else ''}")
+                                        if escalator_count > 0:
+                                            accessibility_text.append(f"{escalator_count} escalator{'s' if escalator_count > 1 else ''}")
+                        except Exception as e:
+                            print(f"Accessibility fetch error: {e}")
+                            
+                        print(f"Step: {depart_stop}, Accessibility: {accessibility_text}")
+
+                        if current_virtual_time == 0:
+                            first_station_name = depart_stop
+                            user_walk_seconds = int(total_walk_meters / user_speed)
+                            user_arrival_ts = now.timestamp() + user_walk_seconds
+                            
+                            time_to_spare = this_depart_ts - user_arrival_ts
+                            if time_to_spare < 0:
+                                route_confidence = 'low'
+                                route_warning = "Impossible: Departs before you arrive"
+                            elif time_to_spare < 90:
+                                route_confidence = 'medium'
+                                route_warning = "Rush: Catching first train is tight"
+                                
+                        else:
+                            prev_arrival_ts = current_virtual_time
+                            transfer_gap = this_depart_ts - prev_arrival_ts
+                            
+                            if transfer_gap < 120:
+                                if route_confidence != 'low':
+                                    route_confidence = 'medium'
+                                    route_warning = f"Tight Transfer at {depart_stop}"
+                                if transfer_gap < 60:
+                                    route_confidence = 'low'
+                                    route_warning = f"Impossible Transfer at {depart_stop}"
+
+                        current_virtual_time = this_arrive_ts
                         if line_name not in transit_lines: transit_lines.append(line_name)
-                        clean_steps.append({'instruction': f"Board <b>{line_name}</b> at {depart_stop}"})
-                        clean_steps.append({'instruction': f"Ride {num_stops} stops"})
+                        
+                        clean_steps.append({
+                            'instruction': f"Take <b>{line_name}</b> from {depart_stop}",
+                            'is_transit': True,
+                            'departure_time': this_depart_ts,
+                            'arrival_time': this_arrive_ts,
+                            'stop_id': depart_id,
+                            'dest_stop_id': arrive_id,
+                            'station_name': depart_stop,
+                            'path': step_path,
+                            'line_name': line_name,
+                            'mode': 'transit',
+                            'accessibility_info': ", ".join(accessibility_text) if accessibility_text else None
+                        })
                     else:
                         clean_steps.append({'instruction': step['html_instructions']})
-
-                route_summary = "Via " + " & ".join(transit_lines) if transit_lines else "Walking Route"
+ 
+                user_walk_seconds = int(total_walk_meters / user_speed)
+                user_walk_minutes = int(user_walk_seconds / 60)
+                user_arrival_at_station_dt = now + timedelta(seconds=user_walk_seconds)
+                user_arrival_str = user_arrival_at_station_dt.strftime("%-I:%M %p")
                 
+                first_train_ts = next((s['departure_time'] for s in clean_steps if s.get('is_transit')), 0)
+                train_depart_str = datetime.fromtimestamp(first_train_ts).strftime("%-I:%M %p") if first_train_ts else "N/A"
+ 
+                route_summary = "Via " + " & ".join(transit_lines) if transit_lines else "Walking Route"
+ 
                 path_points = []
                 if 'overview_polyline' in route:
-                    import polyline 
                     points = polyline.decode(route['overview_polyline']['points'])
                     path_points = [{'lat': p[0], 'lng': p[1]} for p in points]
-
+ 
                 valid_routes.append({
                     'id': i,
-                    'sort_arrival': real_arrival_val, # We sort by when you get to the destination
                     'summary': route_summary,
-                    'distance': leg['distance']['text'],
-                    'duration': f"{real_duration_min} min",
-                    'time_range': f"Leave Now – {(datetime.fromtimestamp(real_arrival_val)).strftime('%-I:%M %p')}",
-                    'countdown': countdown_text,
-                    'station_eta': f"Reach {first_station_name} by {station_eta_text}",
+                    'duration': leg['duration']['text'],
+                    'time_range': f"Arr: {leg['arrival_time']['text']}",
+                    'station_eta': f"Reach {first_station_name} by {user_arrival_str}",
                     'steps': clean_steps,
-                    'path': path_points
+                    'path': path_points,
+                    'catch_confidence': route_confidence,
+                    'warning': route_warning,
+                    'walk_minutes': f"{user_walk_minutes} min walk",
+                    'user_arrival_time': user_arrival_str,
+                    'train_departure_time': train_depart_str,
                 })
-
-            # Sort by Earliest Arrival at Destination(s)
-            valid_routes.sort(key=lambda x: x['sort_arrival'])
-            
-            # --- 6. RETURN TOP 3 ---
-            return jsonify({'success': True, 'data': valid_routes[:3]})
+ 
+            valid_routes.sort(key=lambda x: (1 if x['catch_confidence']=='high' else 2 if x['catch_confidence']=='medium' else 3, x['id']))
+            print(f"Returning {len(valid_routes)} routes")
+            return jsonify({'success': True, 'data': valid_routes[:5]})
         
         else:
+            print(f"Google returned status: {res['status']}")
             return jsonify({'success': False, 'error': f"Google Error: {res['status']}"})
-
+ 
     except Exception as e:
         print(f"Server Error: {e}")
         return jsonify({'success': False, 'error': str(e)})
-    
-@app.route('/api/favorites', methods=['GET', 'POST', 'DELETE'])
-def handle_favorites():
-    """
-    STUB: Keeps the frontend happy without a database.
-    Always returns empty success.
-    """
-    return jsonify({'success': True, 'data': []})
-
-
-# to fetch the live positions of all subway trains.
-@app.route('/api/mbta/vehicles', methods=['GET'])
-def get_vehicles():
-    """
-    Fetches real-time locations of all active subway trains.
-    """
+ 
+@app.route('/api/speak', methods=['GET', 'POST'])
+def text_to_speech():
     try:
-        # We want all major subway lines
-        routes = "Red,Orange,Blue,Green-B,Green-C,Green-D,Green-E"
+        text = request.args.get('text') or (request.json.get('text') if request.is_json else None)
         
-        headers = {"x-api-key": MBTA_API_KEY}
-        params = {
-            'filter[route]': routes,
-            'include': 'route' 
+        if not text:
+            return jsonify({'success': False, 'error': 'No text provided'})
+ 
+        if not ELEVENLABS_API_KEY:
+            return jsonify({'success': False, 'error': 'ElevenLabs Key Missing'})
+ 
+        url = f"https://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}"
+        headers = {
+            "Accept": "audio/mpeg",
+            "Content-Type": "application/json",
+            "xi-api-key": ELEVENLABS_API_KEY
         }
-        
-        response = requests.get(f'{MBTA_BASE_URL}/vehicles', params=params, headers=headers)
-        
+        payload = {
+            "text": text,
+            "model_id": "eleven_turbo_v2_5",
+            "voice_settings": {"stability": 0.5, "similarity_boost": 0.5}
+        }
+ 
+        response = requests.post(url, json=payload, headers=headers)
+ 
         if response.status_code == 200:
-            raw_data = response.json()['data']
-            vehicles = []
-            
-            for v in raw_data:
-                # Extract Line Name (Red, Orange, etc.)
-                route_id = v['relationships']['route']['data']['id']
-                
-                vehicles.append({
-                    'id': v['id'],
-                    'lat': v['attributes']['latitude'],
-                    'lng': v['attributes']['longitude'],
-                    'bearing': v['attributes']['bearing'], # Direction (0-360 degrees)
-                    'route': route_id,
-                    'status': v['attributes']['current_status'] # STOPPED_AT, IN_TRANSIT_TO
-                })
-                
-            return jsonify({'success': True, 'data': vehicles})
-            
-        return jsonify({'success': False, 'data': []})
-
+            return Response(response.content, mimetype="audio/mpeg")
+        else:
+            print(f"ElevenLabs Failed: {response.status_code} - {response.text}")
+            return jsonify({'success': False, 'error': response.text})
+ 
     except Exception as e:
-        print(f"Error fetching vehicles: {e}")
-        return jsonify({
-            'success': False, 
-            'error': str(e),
-            'message': 'Failed to fetch live vehicle data.'
-        }), 500
-
+        print(f"TTS Error: {e}")
+        return jsonify({'success': False, 'error': str(e)})
+ 
 if __name__ == '__main__':
-    print("🚇 MBTA Backend Running on Port 5001...")
-    app.run(debug=True, port=5001,host='0.0.0.0')
+    print("MBTA Backend Running on Port 5001...")
+    app.run(debug=True, port=5001, host='0.0.0.0')
